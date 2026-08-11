@@ -1,0 +1,1286 @@
+```powershell
+<#
+.SYNOPSIS
+    DFIN - Digital Forensic Investigation Tool
+    Simple Windows forensic CLI.
+
+.DESCRIPTION
+    Collects:
+      1. Installed / Uninstalled software
+      2. Created / Modified / Deleted files
+      3. User login history
+      4. Full report
+
+    Requires Administrator privileges.
+
+    NOTE:
+    Software uninstall detection is based on Windows evidence.
+    If an application does not generate an uninstall event or leaves
+    no recoverable evidence, no forensic tool can guarantee detection.
+#>
+
+# ==================== TERMINAL THEME ====================
+
+$Host.UI.RawUI.BackgroundColor = 'Black'
+$Host.UI.RawUI.ForegroundColor = 'Green'
+Clear-Host
+
+
+# ==================== SELF-ELEVATION ====================
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+
+    Write-Host "`n[!] Administrator privileges required. Triggering UAC prompt..." -ForegroundColor Green
+    Start-Sleep -Seconds 1
+
+    $cmd = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    Start-Process powershell.exe -ArgumentList $cmd -Verb RunAs
+    exit
+}
+
+
+# ==================== LAYOUT HELPERS ====================
+
+function PR($t, $n) {
+    if ($null -eq $t) {
+        $t = ""
+    }
+
+    $t = [string]$t
+    $l = $t.Length
+
+    if ($l -ge $n) {
+        return $t.Substring(0, $n)
+    }
+
+    return $t + (" " * ($n - $l))
+}
+
+function Sep {
+    Write-Host ("-" * 70) -ForegroundColor DarkGreen
+}
+
+
+# ==================== BANNER ====================
+
+function Show-Banner {
+
+    Clear-Host
+
+    Write-Host ""
+    Write-Host "          ____   ____  _  _   _  _______             " -ForegroundColor Green
+    Write-Host "         |  _ \ |  __|| || \ | ||__| |__|            " -ForegroundColor Green
+    Write-Host "         | | | || |_  | ||  \| |   | |               " -ForegroundColor Green
+    Write-Host "         | |_| ||  _| | || |\  |   | |               " -ForegroundColor Green
+    Write-Host "         |____/ |_|   |_||_| \_|   |_|               " -ForegroundColor Green
+    Write-Host "                                                     " -ForegroundColor Green
+    Write-Host ""
+    Write-Host "       Digital Forensic Investigation Tool" -ForegroundColor Green
+    Write-Host "             Host: $env:COMPUTERNAME" -ForegroundColor Green
+    Write-Host "                 User: $env:USERNAME" -ForegroundColor Green
+    Write-Host "--------------------------------------------------" -ForegroundColor DarkGreen
+    Write-Host ""
+}
+
+
+# ==================== INPUT ====================
+
+function Get-DaysInput {
+
+    while ($true) {
+
+        Write-Host "  For how many days (back from today): " -ForegroundColor Green -NoNewline
+        $d = Read-Host
+
+        if ($d -match '^\d+$' -and [int]$d -gt 0) {
+            return [int]$d
+        }
+
+        Write-Host "  Invalid input. Enter a positive number." -ForegroundColor Red
+    }
+}
+
+
+function PressEnter {
+
+    Write-Host ""
+    Write-Host "Press Enter to return to menu..." -ForegroundColor DarkGreen
+    [void][System.Console]::ReadLine()
+}
+
+
+# ============================================================
+# SOFTWARE HELPERS
+# ============================================================
+
+function Get-EventTextValue {
+    param(
+        [System.Diagnostics.Eventing.Reader.EventRecord]$Event,
+        [string[]]$Names
+    )
+
+    try {
+
+        $xml = [xml]$Event.ToXml()
+
+        foreach ($name in $Names) {
+
+            $node = $xml.Event.EventData.Data |
+                Where-Object { $_.Name -eq $name } |
+                Select-Object -First 1
+
+            if ($node -and $node.'#text') {
+                return [string]$node.'#text'
+            }
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+
+function New-SoftwareRow {
+    param(
+        [string]$Name,
+        [datetime]$Time,
+        [string]$Location,
+        [string]$User,
+        [string]$Action,
+        [string]$Source,
+        [string]$Evidence
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        $Name = "Unknown Software"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Location)) {
+        $Location = "N/A"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($User)) {
+        $User = "SYSTEM"
+    }
+
+    return [PSCustomObject]@{
+        Name     = $Name.Trim()
+        Time     = $Time.ToString("dd MMM yyyy, HH:mm")
+        Location = $Location.Trim()
+        User     = $User.Trim()
+        Action   = $Action
+        Source   = $Source
+        Evidence = $Evidence
+    }
+}
+
+
+# ============================================================
+# SOFTWARE DATA
+# ============================================================
+
+function Get-SoftwareData {
+
+    param([int]$Days)
+
+    $start = (Get-Date).AddDays(-$Days)
+
+    $installed   = New-Object System.Collections.Generic.List[object]
+    $uninstalled = New-Object System.Collections.Generic.List[object]
+
+
+    # ========================================================
+    # 1. WINDOWS INSTALLER / MSI
+    # ========================================================
+
+    Write-Host "  [1/2] Checking Windows Installer..." -ForegroundColor DarkGreen
+
+    $msiLogs = @(
+        "Application",
+        "Microsoft-Windows-MsiInstaller/Operational"
+    )
+
+    foreach ($logName in $msiLogs) {
+
+        try {
+
+            $events = Get-WinEvent -FilterHashtable @{
+                LogName   = $logName
+                Id        = 1033, 1034, 11707, 11724
+                StartTime = $start
+            } -ErrorAction Stop
+
+
+            foreach ($evt in $events) {
+
+                $msg = $evt.Message
+
+                if ([string]::IsNullOrWhiteSpace($msg)) {
+                    continue
+                }
+
+
+                # ------------------------------------------------
+                # PRODUCT NAME
+                # ------------------------------------------------
+
+                $name = $null
+
+                if ($msg -match '(?im)Product Name:\s*(.+?)(?:\r?\n|$)') {
+                    $name = $Matches[1].Trim()
+                }
+                elseif ($msg -match '(?im)Product:\s*(.+?)(?:\r?\n|$)') {
+                    $name = $Matches[1].Trim()
+                }
+
+
+                if ([string]::IsNullOrWhiteSpace($name)) {
+                    continue
+                }
+
+
+                # ------------------------------------------------
+                # USER
+                # ------------------------------------------------
+
+                $user = "SYSTEM"
+
+                if ($msg -match '(?im)(?:User Name|User|Account Name):\s*(.+?)(?:\r?\n|$)') {
+
+                    $candidate = $Matches[1].Trim()
+
+                    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                        $user = $candidate
+                    }
+                }
+
+
+                # ------------------------------------------------
+                # ACTION
+                # ------------------------------------------------
+
+                if ($evt.Id -in 1033,11707) {
+
+                    $installed.Add(
+                        [PSCustomObject]@{
+                            Name     = $name
+                            Time     = $evt.TimeCreated
+                            Location = "Windows Installer"
+                            User     = $user
+                            Source   = "MSI"
+                            Evidence = "Event $($evt.Id)"
+                        }
+                    )
+                }
+                elseif ($evt.Id -in 1034,11724) {
+
+                    $uninstalled.Add(
+                        [PSCustomObject]@{
+                            Name     = $name
+                            Time     = $evt.TimeCreated
+                            Location = "Windows Installer"
+                            User     = $user
+                            Source   = "MSI"
+                            Evidence = "Event $($evt.Id)"
+                        }
+                    )
+                }
+            }
+        }
+        catch {
+            # Log may not exist on this Windows installation.
+        }
+    }
+
+
+    # ========================================================
+    # 2. WINGET LOGS
+    # ========================================================
+
+    Write-Host "  [2/2] Checking WinGet logs..." -ForegroundColor DarkGreen
+
+    try {
+
+        $wingetLogDir = Join-Path `
+            $env:LOCALAPPDATA `
+            "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
+
+
+        if (Test-Path $wingetLogDir) {
+
+            $logFiles = Get-ChildItem `
+                -Path $wingetLogDir `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
+
+
+            foreach ($file in $logFiles) {
+
+                if ($file.LastWriteTime -lt $start) {
+                    continue
+                }
+
+
+                try {
+
+                    $content = Get-Content `
+                        -LiteralPath $file.FullName `
+                        -Raw `
+                        -ErrorAction SilentlyContinue
+
+                    if ([string]::IsNullOrWhiteSpace($content)) {
+                        continue
+                    }
+
+
+                    # Only process logs that contain uninstall activity.
+                    if ($content -notmatch '(?i)\buninstall\b|\buninstalled\b|\buninstallation\b') {
+                        continue
+                    }
+
+
+                    # ------------------------------------------------
+                    # TRY TO FIND SOFTWARE NAME
+                    # ------------------------------------------------
+
+                    $names = New-Object System.Collections.Generic.List[string]
+
+
+                    # Common WinGet patterns
+                    $patterns = @(
+                        '(?im)Found\s+(.+?)\s+\[',
+                        '(?im)Successfully uninstalled\s+(.+?)(?:\r?\n|$)',
+                        '(?im)Uninstalling\s+(.+?)(?:\r?\n|$)',
+                        '(?im)Uninstall\s+(.+?)(?:\r?\n|$)'
+                    )
+
+
+                    foreach ($pattern in $patterns) {
+
+                        $matches = [regex]::Matches(
+                            $content,
+                            $pattern
+                        )
+
+                        foreach ($match in $matches) {
+
+                            if ($match.Groups.Count -gt 1) {
+
+                                $candidate = $match.Groups[1].Value.Trim()
+
+                                if (
+                                    $candidate.Length -gt 1 -and
+                                    $candidate.Length -lt 150 -and
+                                    $candidate -notmatch '^(package|application|command|operation)$'
+                                ) {
+
+                                    $names.Add($candidate)
+                                }
+                            }
+                        }
+                    }
+
+
+                    # ------------------------------------------------
+                    # SPECIAL CASE: CURL
+                    # ------------------------------------------------
+
+                    if (
+                        $content -match '(?i)\bcurl\b' -and
+                        $content -match '(?i)\buninstall\b|\buninstalled\b'
+                    ) {
+
+                        $names.Add("cURL")
+                    }
+
+
+                    $uniqueNames = @(
+                        $names |
+                        Sort-Object -Unique
+                    )
+
+
+                    foreach ($name in $uniqueNames) {
+
+                        $uninstalled.Add(
+                            [PSCustomObject]@{
+                                Name     = $name
+                                Time     = $file.LastWriteTime
+                                Location = "WinGet"
+                                User     = $env:USERNAME
+                                Source   = "WinGet"
+                                Evidence = $file.Name
+                            }
+                        )
+                    }
+                }
+                catch {
+                    continue
+                }
+            }
+        }
+    }
+    catch {
+        # WinGet may not be installed.
+    }
+
+
+    # ========================================================
+    # REMOVE DUPLICATES
+    # ========================================================
+
+    $installed = @(
+        $installed |
+        Sort-Object Time |
+        Group-Object -Property {
+            "$($_.Name)|$($_.Time.ToString('yyyyMMddHHmm'))|$($_.Source)"
+        } |
+        ForEach-Object {
+            $_.Group | Select-Object -First 1
+        }
+    )
+
+
+    $uninstalled = @(
+        $uninstalled |
+        Sort-Object Time |
+        Group-Object -Property {
+            "$($_.Name)|$($_.Time.ToString('yyyyMMddHHmm'))|$($_.Source)"
+        } |
+        ForEach-Object {
+            $_.Group | Select-Object -First 1
+        }
+    )
+
+
+    return @{
+        Installed   = $installed
+        Uninstalled = $uninstalled
+    }
+}
+
+
+# ============================================================
+# FILE DATA
+# ============================================================
+
+function Get-FileData {
+
+    param([int]$Days)
+
+    $start = (Get-Date).AddDays(-$Days)
+
+    $files = New-Object System.Collections.Generic.List[object]
+
+
+    try {
+
+        Write-Host "  [~] Reading Windows Security file events..." -ForegroundColor DarkGreen
+
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4663, 4660
+            StartTime = $start
+        } -ErrorAction Stop | Sort-Object TimeCreated
+
+
+        foreach ($evt in $events) {
+
+            $msg = $evt.Message
+
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                continue
+            }
+
+
+            $user = "N/A"
+            $objectName = "N/A"
+
+
+            if ($msg -match '(?im)Account Name:\s+([^\r\n]+)') {
+
+                $user = $Matches[1].Trim()
+            }
+
+
+            if ($msg -match '(?im)Object Name:\s+([^\r\n]+)') {
+
+                $objectName = $Matches[1].Trim()
+            }
+
+
+            if ($objectName -eq "N/A") {
+                continue
+            }
+
+
+            $action = "Accessed"
+
+
+            # 4660 = object deletion
+            if ($evt.Id -eq 4660) {
+
+                $action = "Deleted"
+            }
+            elseif ($msg -match '(?i)Delete|DELETE') {
+
+                $action = "Deleted"
+            }
+            elseif ($msg -match '(?i)WriteData|AddFile|AppendData') {
+
+                $action = "Created"
+            }
+            elseif ($msg -match '(?i)WriteAttributes|WriteEA|SetSecurity') {
+
+                $action = "Modified"
+            }
+
+
+            $leafName = $objectName
+
+            try {
+
+                if ($objectName -match '\\') {
+                    $leafName = Split-Path $objectName -Leaf
+                }
+            }
+            catch {
+                $leafName = $objectName
+            }
+
+
+            $files.Add(
+                [PSCustomObject]@{
+                    Action   = $action
+                    Name     = $leafName
+                    Time     = $evt.TimeCreated.ToString("dd MMM yyyy, HH:mm")
+                    Location = $objectName
+                    User     = $user
+                }
+            )
+        }
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "      [!] Security file auditing is unavailable or not enabled." `
+            -ForegroundColor DarkYellow
+    }
+
+
+    return @(
+        $files |
+        Sort-Object Time
+    )
+}
+
+
+# ============================================================
+# LOGIN DATA
+# ============================================================
+
+function Get-LoginData {
+
+    param([int]$Days)
+
+    $start = (Get-Date).AddDays(-$Days)
+
+    $raw = New-Object System.Collections.Generic.List[object]
+
+
+    try {
+
+        Write-Host "  [@] Reading Windows Security login events..." -ForegroundColor DarkGreen
+
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4624, 4625, 4634, 4647
+            StartTime = $start
+        } -ErrorAction Stop | Sort-Object TimeCreated
+
+
+        foreach ($evt in $events) {
+
+            $msg = $evt.Message
+
+            if ([string]::IsNullOrWhiteSpace($msg)) {
+                continue
+            }
+
+
+            $targetUser = "N/A"
+            $targetDomain = "N/A"
+            $logonType = "N/A"
+            $workstation = "N/A"
+            $ipAddress = "-"
+
+
+            # ------------------------------------------------
+            # USER
+            # ------------------------------------------------
+
+            if ($msg -match '(?im)Account Name:\s+([^\r\n]+)') {
+
+                $targetUser = $Matches[1].Trim()
+            }
+
+
+            # ------------------------------------------------
+            # DOMAIN
+            # ------------------------------------------------
+
+            if ($msg -match '(?im)Account Domain:\s+([^\r\n]+)') {
+
+                $targetDomain = $Matches[1].Trim()
+            }
+
+
+            # ------------------------------------------------
+            # LOGON TYPE
+            # ------------------------------------------------
+
+            if ($msg -match '(?im)Logon Type:\s+(\d+)') {
+
+                $logonType = $Matches[1]
+            }
+
+
+            # ------------------------------------------------
+            # WORKSTATION
+            # ------------------------------------------------
+
+            if ($msg -match '(?im)Workstation Name:\s+([^\r\n]+)') {
+
+                $workstation = $Matches[1].Trim()
+            }
+
+
+            # ------------------------------------------------
+            # SOURCE IP
+            # ------------------------------------------------
+
+            if ($msg -match '(?im)Source Network Address:\s+([^\r\n]+)') {
+
+                $ipAddress = $Matches[1].Trim()
+            }
+
+
+            # ------------------------------------------------
+            # FILTER SYSTEM ACCOUNTS
+            # ------------------------------------------------
+
+            if ([string]::IsNullOrWhiteSpace($targetUser)) {
+                continue
+            }
+
+            if ($targetUser -eq "N/A") {
+                continue
+            }
+
+            if ($targetUser -in @(
+                "SYSTEM",
+                "LOCAL SERVICE",
+                "NETWORK SERVICE",
+                "ANONYMOUS LOGON"
+            )) {
+                continue
+            }
+
+            if ($targetUser -match '^(UMFD|DWM|IUSR|DefaultAccount|Font Driver|Window Manager)-?\d*$') {
+                continue
+            }
+
+
+            # ------------------------------------------------
+            # EVENT TYPE
+            # ------------------------------------------------
+
+            $typeDesc = "Other"
+
+
+            switch ($evt.Id) {
+
+                4624 {
+
+                    switch ([string]$logonType) {
+
+                        "2"  { $typeDesc = "Interactive" }
+                        "3"  { $typeDesc = "Network" }
+                        "7"  { $typeDesc = "Unlock" }
+                        "10" { $typeDesc = "RemoteDesktop" }
+
+                        default {
+                            $typeDesc = "Type $logonType"
+                        }
+                    }
+                }
+
+                4625 {
+                    $typeDesc = "Failed"
+                }
+
+                4634 {
+                    $typeDesc = "Logoff"
+                }
+
+                4647 {
+                    $typeDesc = "Logoff"
+                }
+            }
+
+
+            $status = "Success"
+
+            if ($evt.Id -eq 4625) {
+                $status = "Failed"
+            }
+            elseif ($evt.Id -in 4634,4647) {
+                $status = "Logoff"
+            }
+
+
+            $ws = $workstation
+
+            if ($ipAddress -ne "-" -and
+                $ipAddress -ne $workstation -and
+                $ipAddress -ne "::1" -and
+                $ipAddress -ne "127.0.0.1") {
+
+                $ws = "$workstation ($ipAddress)"
+            }
+
+
+            $raw.Add(
+                [PSCustomObject]@{
+                    User        = $targetUser
+                    Time        = $evt.TimeCreated
+                    TimeStr     = $evt.TimeCreated.ToString("dd MMM yyyy, HH:mm")
+                    Type        = $typeDesc
+                    Workstation = $ws
+                    Status      = $status
+                }
+            )
+        }
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "      [!] Security login events unavailable: $($_.Exception.Message)" `
+            -ForegroundColor DarkYellow
+    }
+
+
+    # One event per user/type/minute
+    $deduped = @(
+        $raw |
+        Group-Object -Property {
+            $_.User + "|" + $_.Type + "|" + $_.Time.ToString("yyyyMMddHHmm")
+        } |
+        ForEach-Object {
+            $_.Group | Select-Object -First 1
+        } |
+        Sort-Object Time
+    )
+
+
+    return $deduped
+}
+
+
+# ============================================================
+# RENDERERS
+# ============================================================
+
+function Render-Stats($Software, $Files, $Logins) {
+
+    Write-Host ""
+    Write-Host "    STATISTICS" -ForegroundColor Green
+    Sep
+
+    $fmt = "    {0,-14} {1,6} {2}"
+
+    Write-Host ($fmt -f "Installed", $Software.Installed.Count, "software packages") `
+        -ForegroundColor Green
+
+    Write-Host ($fmt -f "Uninstalled", $Software.Uninstalled.Count, "software packages") `
+        -ForegroundColor Green
+
+    Write-Host ($fmt -f "File Events", $Files.Count, "created / modified / deleted") `
+        -ForegroundColor Green
+
+    Write-Host ($fmt -f "User Logins", $Logins.Count, "session events") `
+        -ForegroundColor Green
+
+    Write-Host ""
+    Sep
+}
+
+
+function SectionHeader($icon, $title, $count) {
+
+    Write-Host ""
+    Write-Host "  $icon  $title  ($count found)" -ForegroundColor Green
+    Sep
+}
+
+
+# ============================================================
+# SOFTWARE RENDERER
+# ============================================================
+
+function Render-Software($Software, $Days) {
+
+    # ========================================================
+    # INSTALLED
+    # ========================================================
+
+    SectionHeader "[+]" "INSTALLED SOFTWARE" $Software.Installed.Count
+
+    if ($Software.Installed.Count -eq 0) {
+
+        Write-Host "  No verified installation events found." `
+            -ForegroundColor DarkGreen
+    }
+    else {
+
+        Write-Host ""
+        Write-Host "  $(PR "SOFTWARE" 28) $(PR "TIME" 21) $(PR "SOURCE" 12)" `
+            -ForegroundColor DarkGreen
+
+        Sep
+
+
+        foreach ($sw in $Software.Installed) {
+
+            $name = $sw.Name
+
+            if ($name.Length -gt 28) {
+                $name = $name.Substring(0, 25) + "..."
+            }
+
+
+            Write-Host "  $(PR $name 28) " `
+                -NoNewline `
+                -ForegroundColor Green
+
+            Write-Host "$(PR $sw.Time 21) " `
+                -NoNewline `
+                -ForegroundColor Green
+
+            Write-Host "$(PR $sw.Source 12)" `
+                -ForegroundColor Green
+        }
+    }
+
+
+    Write-Host ""
+
+
+    # ========================================================
+    # UNINSTALLED
+    # ========================================================
+
+    SectionHeader "[x]" "UNINSTALLED SOFTWARE" $Software.Uninstalled.Count
+
+    if ($Software.Uninstalled.Count -eq 0) {
+
+        Write-Host "  No verified uninstallation events found." `
+            -ForegroundColor DarkGreen
+
+        Write-Host ""
+        Write-Host "  Note: Software removed without a retained Windows/WinGet" `
+            -ForegroundColor DarkGreen
+
+        Write-Host "        uninstall record cannot be reconstructed reliably." `
+            -ForegroundColor DarkGreen
+    }
+    else {
+
+        Write-Host ""
+        Write-Host "  $(PR "SOFTWARE" 28) $(PR "TIME" 21) $(PR "SOURCE" 12)" `
+            -ForegroundColor DarkGreen
+
+        Sep
+
+
+        foreach ($sw in $Software.Uninstalled) {
+
+            $name = $sw.Name
+
+            if ($name.Length -gt 28) {
+                $name = $name.Substring(0, 25) + "..."
+            }
+
+
+            Write-Host "  $(PR $name 28) " `
+                -NoNewline `
+                -ForegroundColor Yellow
+
+            Write-Host "$(PR $sw.Time 21) " `
+                -NoNewline `
+                -ForegroundColor Yellow
+
+            Write-Host "$(PR $sw.Source 12)" `
+                -ForegroundColor Yellow
+        }
+
+
+        Write-Host ""
+
+        Write-Host "  Evidence:" -ForegroundColor DarkGreen
+
+        foreach ($sw in $Software.Uninstalled) {
+
+            Write-Host "    $($sw.Name) -> $($sw.Evidence)" `
+                -ForegroundColor DarkGreen
+        }
+    }
+}
+
+# ============================================================
+# FILE RENDERER
+# ============================================================
+
+function Render-Files($Files, $Days) {
+
+    SectionHeader "[~]" "FILE ACTIVITY" $Files.Count
+
+
+    if ($Files.Count -eq 0) {
+
+        Write-Host "      [-] No file events found. Auditing may not be enabled." `
+            -ForegroundColor DarkGreen
+    }
+    else {
+
+        Write-Host "  $(PR "ACTION" 12) $(PR "FILE NAME" 26) $(PR "TIME" 18) $(PR "USER" 10)" `
+            -ForegroundColor DarkGreen
+
+
+        foreach ($f in ($Files | Select-Object -First 50)) {
+
+            $badge = switch ($f.Action) {
+
+                "Created"  { "+ CREATED" }
+                "Deleted"  { "x DELETED" }
+                "Modified" { "~ MODIFIED" }
+
+                default {
+                    "  ACCESSED"
+                }
+            }
+
+
+            $bc = switch ($f.Action) {
+
+                "Created"  { "Green" }
+                "Deleted"  { "Red" }
+                "Modified" { "Yellow" }
+
+                default {
+                    "DarkGreen"
+                }
+            }
+
+
+            $name = $f.Name
+
+            if ($name.Length -gt 26) {
+                $name = $name.Substring(0, 23) + "..."
+            }
+
+
+            Write-Host "  " -NoNewline
+
+            Write-Host $(PR $badge 12) `
+                -ForegroundColor $bc `
+                -NoNewline
+
+            Write-Host " $(PR $name 26) $(PR $f.Time 18) " `
+                -NoNewline `
+                -ForegroundColor Green
+
+            Write-Host $(PR $f.User 10) `
+                -ForegroundColor Green
+        }
+
+
+        if ($Files.Count -gt 50) {
+
+            Write-Host "      ... and $($Files.Count - 50) more events" `
+                -ForegroundColor DarkGreen
+        }
+    }
+}
+
+
+# ============================================================
+# LOGIN RENDERER
+# ============================================================
+
+function Render-Logins($Logins, $Days) {
+
+    SectionHeader "[@]" "USER LOGIN HISTORY" $Logins.Count
+
+
+    if ($Logins.Count -eq 0) {
+
+        Write-Host "      [-] No login events found." -ForegroundColor DarkGreen
+    }
+    else {
+
+        Write-Host "  $(PR "USER" 16) $(PR "TIME" 21) $(PR "TYPE" 12) $(PR "WORKSTATION" 16)" `
+            -ForegroundColor DarkGreen
+
+
+        foreach ($l in ($Logins | Select-Object -First 50)) {
+
+            $badge = switch ($l.Type) {
+
+                "Interactive"   { "[DESKTOP]" }
+                "RemoteDesktop" { "[RDP]" }
+                "Network"       { "[NETWORK]" }
+                "Unlock"        { "[UNLOCK]" }
+                "Logoff"        { "[LOGOFF]" }
+                "Failed"        { "[FAILED]" }
+
+                default {
+                    "[OTHER]"
+                }
+            }
+
+
+            $bc = switch ($l.Type) {
+
+                "Interactive"   { "Green" }
+                "RemoteDesktop" { "Yellow" }
+                "Network"       { "Green" }
+                "Unlock"        { "Green" }
+                "Logoff"        { "DarkGreen" }
+                "Failed"        { "Red" }
+
+                default {
+                    "DarkGreen"
+                }
+            }
+
+
+            $uc = if ($l.Status -eq "Failed") {
+                "Red"
+            }
+            else {
+                "Green"
+            }
+
+
+            $tc = if ($l.Status -eq "Failed") {
+                "Red"
+            }
+            else {
+                "Green"
+            }
+
+
+            $ws = $l.Workstation
+
+            if ($ws.Length -gt 16) {
+                $ws = $ws.Substring(0, 13) + "..."
+            }
+
+
+            Write-Host "  " -NoNewline
+
+            Write-Host $(PR $l.User 16) `
+                -ForegroundColor $uc `
+                -NoNewline
+
+            Write-Host " $(PR $l.TimeStr 21) " `
+                -NoNewline `
+                -ForegroundColor $tc
+
+            Write-Host $(PR $badge 12) `
+                -ForegroundColor $bc `
+                -NoNewline
+
+            Write-Host " $(PR $ws 16)" `
+                -ForegroundColor Green
+        }
+
+
+        if ($Logins.Count -gt 50) {
+
+            Write-Host "      ... and $($Logins.Count - 50) more events" `
+                -ForegroundColor DarkGreen
+        }
+    }
+}
+
+
+# ============================================================
+# FULL REPORT
+# ============================================================
+
+function Render-FullReport($Software, $Files, $Logins, $Days) {
+
+    Show-Banner
+
+    Render-Stats $Software $Files $Logins
+    Render-Software $Software $Days
+    Render-Files $Files $Days
+    Render-Logins $Logins $Days
+
+    PressEnter
+}
+
+
+# ============================================================
+# MAIN MENU
+# ============================================================
+
+while ($true) {
+
+    Show-Banner
+
+    Write-Host "  What to look for?" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "  [1]  Installed/Uninstalled software" -ForegroundColor Green
+    Write-Host "  [2]  Created/Deleted files" -ForegroundColor Green
+    Write-Host "  [3]  User Login history" -ForegroundColor Green
+    Write-Host "  [4]  All (Full forensic report)" -ForegroundColor Green
+    Write-Host "  [5]  Exit" -ForegroundColor Red
+
+    Write-Host ""
+
+    Write-Host "  dfin > " -ForegroundColor Green -NoNewline
+    $choice = Read-Host
+
+
+    switch ($choice) {
+
+        # ====================================================
+        # SOFTWARE
+        # ====================================================
+
+        "1" {
+
+            $days = Get-DaysInput
+
+            Show-Banner
+
+            Write-Host "  [+] Collecting software installation evidence..." `
+                -ForegroundColor Green
+
+            Write-Host ""
+
+            $sw = Get-SoftwareData -Days $days
+
+            Render-Software $sw $days
+
+            PressEnter
+        }
+
+
+        # ====================================================
+        # FILES
+        # ====================================================
+
+        "2" {
+
+            $days = Get-DaysInput
+
+            Show-Banner
+
+            Write-Host "  [~] Scanning Security log for file events..." `
+                -ForegroundColor Green
+
+            Write-Host ""
+
+            $files = Get-FileData -Days $days
+
+            Render-Files $files $days
+
+            PressEnter
+        }
+
+
+        # ====================================================
+        # LOGIN HISTORY
+        # ====================================================
+
+        "3" {
+
+            $days = Get-DaysInput
+
+            Show-Banner
+
+            Write-Host "  [@] Scanning Security log for login events..." `
+                -ForegroundColor Green
+
+            Write-Host ""
+
+            $logins = Get-LoginData -Days $days
+
+            Render-Logins $logins $days
+
+            PressEnter
+        }
+
+
+        # ====================================================
+        # FULL REPORT
+        # ====================================================
+
+        "4" {
+
+            $days = Get-DaysInput
+
+            Show-Banner
+
+            Write-Host "  [*] Collecting forensic data..." `
+                -ForegroundColor Green
+
+            Write-Host ""
+
+            $sw      = Get-SoftwareData -Days $days
+            $files   = Get-FileData -Days $days
+            $logins  = Get-LoginData -Days $days
+
+            Render-FullReport $sw $files $logins $days
+        }
+
+
+        # ====================================================
+        # EXIT
+        # ====================================================
+
+        "5" {
+
+            Write-Host ""
+            Write-Host "  [*] Exiting DFIN. Stay safe." -ForegroundColor Green
+
+            Start-Sleep -Seconds 1
+
+            exit
+        }
+
+
+        # ====================================================
+        # INVALID OPTION
+        # ====================================================
+
+        default {
+
+            Write-Host ""
+            Write-Host "  [!] Invalid choice. Press Enter to continue..." `
+                -ForegroundColor Red
+
+            [void][System.Console]::ReadLine()
+        }
+    }
+}
+```
