@@ -1,4 +1,4 @@
-# DFIN — Digital Forensic Information
+# DFINT — Digital Forensic Investigation Tool
 
 A small PowerShell-based Windows CLI utility for basic forensic triage.
 
@@ -20,18 +20,12 @@ A small PowerShell-based Windows CLI utility for basic forensic triage.
 
 ## Installation
 
-Clone or download the project, then open PowerShell in the DFIN directory.
-
-For the current PowerShell process:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-```
+Clone or download the project, then open PowerShell in the DFINT directory.
 
 ## Usage
 
 ```powershell
-.\DFIN.ps1
+.\DFINT.ps1
 ```
 
 Then choose a collector:
@@ -46,25 +40,25 @@ Then choose a collector:
 
 Enter the requested number of days.
 
-Optional JSON export:
+Optional JSON export:  // TO DO
 
 ```powershell
-.\DFIN.ps1 -Export
+.\DFINT.ps1 -Export
 ```
 
 The report is written to the current directory as:
 
 ```text
-DFIN-report-YYYY-MM-DD-HH-mm-ss.json
+DFINT-report-YYYY-MM-DD-HH-mm-ss.json
 ```
 
 ## Administrator requirement
 
-DFIN does not automatically elevate itself. If it is not running as Administrator, it warns that Security Event Log and some filesystem/USN information may be unavailable.
+DFINT does not automatically elevate itself. If it is not running as Administrator, it warns that Security Event Log and some filesystem/USN information may be unavailable.
 
 ## USN Journal limitation
 
-Deleted-file detection is based on records still present in the NTFS USN Change Journal. The USN Journal is a rolling journal. If the relevant records have already been overwritten, DFIN cannot recover those historical deletion events from the journal.
+Deleted-file detection is based on records still present in the NTFS USN Change Journal. The USN Journal is a rolling journal. If the relevant records have already been overwritten, DFINT cannot recover those historical deletion events from the journal.
 
 DFIN does not fabricate deleted files, timestamps, or paths.
 
@@ -74,7 +68,7 @@ Login history depends on the Windows Security Event Log retaining the relevant e
 
 ## Forensic note
 
-DFIN is a triage utility, not a replacement for a full forensic acquisition or forensic suite. Results represent evidence available from the Windows artifacts queried by the tool.
+DFINT is a triage utility, not a replacement for a full forensic acquisition or forensic suite. Results represent evidence available from the Windows artifacts queried by the tool.
 
 ## License
 
