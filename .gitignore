@@ -1,2 +1,5 @@
 *.c
 *.exe
+*.json
+*.txt
+*.log
