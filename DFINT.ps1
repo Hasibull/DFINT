@@ -2,6 +2,8 @@
 .SYNOPSIS
     DFIN - Digital Forensic Investigation Tool
     Simple Windows forensic CLI.
+    Author: Hasibul Islam
+    Version: 0.2
 
 .DESCRIPTION
     Collects:
