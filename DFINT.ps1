@@ -1474,16 +1474,17 @@ function Render-FullReport($Software, $Files, $Logins, $Days) {
 function Export-DFINTJson {
 
     param(
-        [hashtable]$Software,
-        [array]$Files,
+        [hashtable]$Software = $null,
+        [array]$Files = $null,
+        [array]$Logins = $null,
         [int]$Days
     )
 
     try {
 
-        # ----------------------------------------------------
-        # Create export directory
-        # ----------------------------------------------------
+        # ====================================================
+        # CREATE REPORT DIRECTORY
+        # ====================================================
 
         $exportDir = Join-Path $PSScriptRoot "reports"
 
@@ -1497,109 +1498,232 @@ function Export-DFINTJson {
         }
 
 
-        # ----------------------------------------------------
-        # Generate filename
-        # ----------------------------------------------------
+        # ====================================================
+        # DETERMINE REPORT TYPE
+        # ====================================================
+
+        $hasSoftware = $null -ne $Software
+        $hasFiles    = $null -ne $Files
+        $hasLogins   = $null -ne $Logins
+
+
+        if ($hasSoftware -and $hasFiles -and $hasLogins) {
+
+            $reportType = "Full Forensic Report"
+            $filePrefix = "DFIN_Full_Report"
+        }
+        elseif ($hasSoftware) {
+
+            $reportType = "Software Report"
+            $filePrefix = "DFIN_Software_Report"
+        }
+        elseif ($hasFiles) {
+
+            $reportType = "File Activity Report"
+            $filePrefix = "DFIN_File_Report"
+        }
+        elseif ($hasLogins) {
+
+            $reportType = "Login History Report"
+            $filePrefix = "DFIN_Login_Report"
+        }
+        else {
+
+            throw "No forensic data supplied for export."
+        }
+
+
+        # ====================================================
+        # FILE NAME
+        # ====================================================
 
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-        $fileName = "DFINT_Report_$timestamp.json"
+        $fileName = "${filePrefix}_${timestamp}.json"
 
         $outputPath = Join-Path $exportDir $fileName
 
 
-        # ----------------------------------------------------
-        # Build report
-        # ----------------------------------------------------
+        # ====================================================
+        # BASE REPORT
+        # ====================================================
 
         $report = [ordered]@{
 
-            tool = [ordered]@{
-                name    = "DFINT"
+            metadata = [ordered]@{
+
+                tool = "DFIN"
+
                 version = "1.0"
-            }
 
-            investigation = [ordered]@{
-                host           = $env:COMPUTERNAME
-                user           = "$env:USERDOMAIN\$env:USERNAME"
+                reportType = $reportType
+
+                host = $env:COMPUTERNAME
+
+                user = "$env:USERDOMAIN\$env:USERNAME"
+
                 collectionTime = (Get-Date).ToString("o")
-                periodDays     = $Days
-                startTime      = (Get-Date).AddDays(-$Days).ToString("o")
-                endTime        = (Get-Date).ToString("o")
-            }
 
-            software = [ordered]@{
+                periodDays = $Days
+
+                startTime = (Get-Date).
+                    AddDays(-$Days).
+                    ToString("o")
+
+                endTime = (Get-Date).ToString("o")
+            }
+        }
+
+
+        # ====================================================
+        # SOFTWARE
+        # ====================================================
+
+        if ($hasSoftware) {
+
+            $report.software = [ordered]@{
 
                 installed = @(
                     $Software.Installed |
                     ForEach-Object {
 
                         [ordered]@{
-                            name      = $_.Name
-                            time      = $_.Time.ToString("o")
-                            location  = $_.Location
-                            user      = $_.User
-                            source    = $_.Source
-                            evidence  = $_.Evidence
+
+                            name = $_.Name
+
+                            time = if ($null -ne $_.Time) {
+                                $_.Time.ToString("o")
+                            }
+                            else {
+                                $null
+                            }
+
+                            location = $_.Location
+
+                            user = $_.User
+
+                            source = $_.Source
+
+                            evidence = $_.Evidence
                         }
                     }
                 )
+
 
                 uninstalled = @(
                     $Software.Uninstalled |
                     ForEach-Object {
 
                         [ordered]@{
-                            name      = $_.Name
-                            time      = $_.Time.ToString("o")
-                            location  = $_.Location
-                            user      = $_.User
-                            source    = $_.Source
-                            evidence  = $_.Evidence
+
+                            name = $_.Name
+
+                            time = if ($null -ne $_.Time) {
+                                $_.Time.ToString("o")
+                            }
+                            else {
+                                $null
+                            }
+
+                            location = $_.Location
+
+                            user = $_.User
+
+                            source = $_.Source
+
+                            evidence = $_.Evidence
                         }
                     }
                 )
             }
+        }
 
 
-            fileActivity = @(
+        # ====================================================
+        # FILE ACTIVITY
+        # ====================================================
+
+        if ($hasFiles) {
+
+            $report.fileActivity = @(
                 $Files |
                 ForEach-Object {
 
                     [ordered]@{
-                        action    = $_.Action
-                        name      = $_.Name
-                        time      = $_.Time.ToString("o")
-                        location  = $_.Location
-                        user      = $_.User
-                        source    = $_.Source
-                        evidence  = $_.Evidence
+
+                        action = $_.Action
+
+                        name = $_.Name
+
+                        time = if ($null -ne $_.Time) {
+                            $_.Time.ToString("o")
+                        }
+                        else {
+                            $null
+                        }
+
+                        location = $_.Location
+
+                        user = $_.User
+
+                        source = $_.Source
+
+                        evidence = $_.Evidence
                     }
                 }
             )
         }
 
 
-        # ----------------------------------------------------
-        # Convert to JSON
-        # ----------------------------------------------------
+        # ====================================================
+        # LOGIN HISTORY
+        # ====================================================
 
-        $json = $report |
-            ConvertTo-Json -Depth 10
+        if ($hasLogins) {
+
+            $report.loginHistory = @(
+                $Logins |
+                ForEach-Object {
+
+                    [ordered]@{
+
+                        action = $_.Action
+
+                        user = $_.User
+
+                        time = if ($null -ne $_.Time) {
+                            $_.Time.ToString("o")
+                        }
+                        else {
+                            $null
+                        }
+
+                        logonType = $_.LogonType
+
+                        sourceIP = $_.SourceIP
+                    }
+                }
+            )
+        }
 
 
-        # ----------------------------------------------------
-        # Write file
-        # ----------------------------------------------------
+        # ====================================================
+        # EXPORT
+        # ====================================================
 
-        $json |
-            Out-File `
-                -FilePath $outputPath `
-                -Encoding utf8 `
-                -Force
+        $report |
+            ConvertTo-Json -Depth 10 |
+            Set-Content `
+                -Path $outputPath `
+                -Encoding UTF8
 
+
+        # ====================================================
+        # RESULT
+        # ====================================================
 
         Write-Host ""
+
         Write-Host "  [+] JSON report exported successfully." `
             -ForegroundColor Green
 
@@ -1611,6 +1735,7 @@ function Export-DFINTJson {
     catch {
 
         Write-Host ""
+
         Write-Host "  [!] Failed to export JSON report." `
             -ForegroundColor Red
 
@@ -1666,6 +1791,10 @@ while ($true) {
 
             Render-Software $sw $days
 
+            Export-DFINTJson `
+                -Software $sw `
+                -Days $days
+
             PressEnter
         }
 
@@ -1689,6 +1818,10 @@ while ($true) {
 
             Render-Files $files $days
 
+            Export-DFINTJson `
+                -Files $files `
+                -Days $days
+
             PressEnter
         }
 
@@ -1711,6 +1844,10 @@ while ($true) {
             $logins = Get-LoginData -Days $days
 
             Render-Logins $logins $days
+
+            Export-DFINTJson `
+                -Logins $logins `
+                -Days $days
 
             PressEnter
         }
@@ -1738,7 +1875,7 @@ while ($true) {
             Render-FullReport $sw $files $logins $days
 
             Export-DFINTJson `
-                -Software $sq `
+                -Software $sw `
                 -Files $files `
                 -Logins $logins `
                 -Days $days
