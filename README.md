@@ -2,13 +2,16 @@
 
 A small PowerShell-based Windows CLI utility for basic forensic triage.
 
+**Snapshoot:** <br>
+<img src="./gallery/snapshoot.jpg">
+
 ## Features
 
 - Installed software from Windows uninstall registry keys
 - Windows Installer uninstall evidence
 - Historical file creation/deletion events from the NTFS USN Change Journal
 - Windows Security Event Log login/logoff history
-- Optional JSON export
+- JSON export
 - Administrator-awareness and graceful error handling
 
 ## Requirements
@@ -40,21 +43,13 @@ Then choose a collector:
 
 Enter the requested number of days.
 
-Optional JSON export:  // TO DO
+JSON export:
 
-```powershell
-.\DFINT.ps1 -Export
-```
-
-The report is written to the current directory as:
-
-```text
-DFINT-report-YYYY-MM-DD-HH-mm-ss.json
-```
+By default DFINT generate a JSON file for the logs inside reports folder.
 
 ## Administrator requirement
 
-DFINT does not automatically elevate itself. If it is not running as Administrator, it warns that Security Event Log and some filesystem/USN information may be unavailable.
+It request for running as Administrator when running. Additionally, it warns that Security Event Log and some filesystem/USN information may be unavailable.
 
 ## USN Journal limitation
 
