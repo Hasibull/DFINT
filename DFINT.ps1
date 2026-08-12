@@ -474,92 +474,344 @@ function Get-FileData {
 
     $start = (Get-Date).AddDays(-$Days)
 
-    $files = New-Object System.Collections.Generic.List[object]
+    $events = New-Object System.Collections.Generic.List[object]
+
+
+    # ========================================================
+    # 1. NTFS USN JOURNAL
+    # ========================================================
+
+    Write-Host "  [1/2] Reading NTFS USN Journal..." -ForegroundColor DarkGreen
 
 
     try {
 
-        Write-Host "  [~] Reading Windows Security file events..." -ForegroundColor DarkGreen
+        # Get local NTFS volumes
+        $volumes = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DriveType=3" `
+            -ErrorAction Stop |
+            Where-Object {
+                $_.FileSystem -eq "NTFS"
+            }
 
-        $events = Get-WinEvent -FilterHashtable @{
+
+        if ($volumes.Count -eq 0) {
+
+            Write-Host "      [!] No NTFS volumes found." `
+                -ForegroundColor DarkYellow
+        }
+
+
+        foreach ($volume in $volumes) {
+
+            $drive = $volume.DeviceID
+
+            Write-Host "      Scanning $drive ..." `
+                -ForegroundColor DarkGreen
+
+
+            # ------------------------------------------------
+            # Read USN journal
+            # ------------------------------------------------
+
+            try {
+
+                $raw = & fsutil.exe usn readjournal $drive csv 2>&1
+
+                if ($LASTEXITCODE -ne 0) {
+
+                    Write-Host "      [!] USN read failed on $drive" `
+                        -ForegroundColor DarkYellow
+
+                    continue
+                }
+
+
+                # ------------------------------------------------
+                # Find CSV header
+                # ------------------------------------------------
+
+                $headerIndex = -1
+
+                for ($i = 0; $i -lt $raw.Count; $i++) {
+
+                    if ([string]$raw[$i] -match '^Usn,File name,') {
+
+                        $headerIndex = $i
+                        break
+                    }
+                }
+
+
+                if ($headerIndex -lt 0) {
+
+                    Write-Host "      [!] USN CSV header not found on $drive" `
+                        -ForegroundColor DarkYellow
+
+                    continue
+                }
+
+
+                # Header + records
+                $csv = @(
+                    $raw[$headerIndex..($raw.Count - 1)] |
+                    ForEach-Object {
+                        [string]$_
+                    }
+                )
+
+
+                $records = $csv | ConvertFrom-Csv
+
+
+                # ------------------------------------------------
+                # Process USN records
+                # ------------------------------------------------
+
+                foreach ($record in $records) {
+
+                    if ([string]::IsNullOrWhiteSpace($record.'File name')) {
+                        continue
+                    }
+
+
+                    # Timestamp
+                    try {
+
+                        $timestamp = [datetime]::Parse(
+                            $record.'Time stamp'
+                        )
+                    }
+                    catch {
+                        continue
+                    }
+
+
+                    # Date range
+                    if ($timestamp -lt $start) {
+                        continue
+                    }
+
+                    if ($timestamp -gt (Get-Date)) {
+                        continue
+                    }
+
+
+                    $reason = [string]$record.Reason
+
+
+                    # ------------------------------------------------
+                    # Determine action
+                    # ------------------------------------------------
+
+                    $action = $null
+
+
+                    if ($reason -match '(?i)File delete') {
+
+                        $action = "Deleted"
+                    }
+                    elseif ($reason -match '(?i)File create') {
+
+                        $action = "Created"
+                    }
+                    elseif (
+                        $reason -match '(?i)Data overwrite' -or
+                        $reason -match '(?i)Data extend' -or
+                        $reason -match '(?i)Data truncation' -or
+                        $reason -match '(?i)Basic info change' -or
+                        $reason -match '(?i)Security change'
+                    ) {
+
+                        $action = "Modified"
+                    }
+                    elseif ($reason -match '(?i)Rename') {
+
+                        $action = "Renamed"
+                    }
+
+
+                    if ($null -eq $action) {
+                        continue
+                    }
+
+
+                    $fileName = [string]$record.'File name'
+
+
+                    # ------------------------------------------------
+                    # USN doesn't contain the complete path.
+                    #
+                    # We keep the volume + filename here rather
+                    # than pretending we know the full path.
+                    # ------------------------------------------------
+
+                    $location = "$drive\$fileName"
+
+
+                    $events.Add(
+                        [PSCustomObject]@{
+                            Action     = $action
+                            Name       = $fileName
+                            Time       = $timestamp
+                            Location   = $location
+                            User       = "N/A"
+                            Source     = "NTFS USN"
+                            Evidence   = "USN $($record.Usn) | $reason"
+                            USN        = [string]$record.Usn
+                            FileID     = [string]$record.'File ID'
+                        }
+                    )
+                }
+            }
+            catch {
+
+                Write-Host "      [!] Error reading USN on $drive : $($_.Exception.Message)" `
+                    -ForegroundColor DarkYellow
+            }
+        }
+    }
+    catch {
+
+        Write-Host "      [!] Could not enumerate NTFS volumes: $($_.Exception.Message)" `
+            -ForegroundColor DarkYellow
+    }
+
+
+    # ========================================================
+    # 2. WINDOWS SECURITY EVENTS 4663 / 4660
+    # ========================================================
+
+    Write-Host "  [2/2] Reading Windows Security file events..." `
+        -ForegroundColor DarkGreen
+
+
+    try {
+
+        $securityEvents = Get-WinEvent -FilterHashtable @{
             LogName   = 'Security'
-            Id        = 4663, 4660
+            Id        = 4663,4660
             StartTime = $start
-        } -ErrorAction Stop | Sort-Object TimeCreated
+        } -ErrorAction Stop |
+        Sort-Object TimeCreated
 
 
-        foreach ($evt in $events) {
+        foreach ($evt in $securityEvents) {
 
-            $msg = $evt.Message
+            $message = $evt.Message
 
-            if ([string]::IsNullOrWhiteSpace($msg)) {
+            if ([string]::IsNullOrWhiteSpace($message)) {
                 continue
             }
 
 
-            $user = "N/A"
-            $objectName = "N/A"
+            # ------------------------------------------------
+            # Object name
+            # ------------------------------------------------
 
+            $objectName = $null
 
-            if ($msg -match '(?im)Account Name:\s+([^\r\n]+)') {
-
-                $user = $Matches[1].Trim()
-            }
-
-
-            if ($msg -match '(?im)Object Name:\s+([^\r\n]+)') {
+            if ($message -match '(?im)Object Name:\s+([^\r\n]+)') {
 
                 $objectName = $Matches[1].Trim()
             }
 
 
-            if ($objectName -eq "N/A") {
+            if ([string]::IsNullOrWhiteSpace($objectName)) {
                 continue
             }
 
 
-            $action = "Accessed"
+            # ------------------------------------------------
+            # User
+            # ------------------------------------------------
+
+            $user = "N/A"
+
+            if ($message -match '(?im)Account Name:\s+([^\r\n]+)') {
+
+                $candidate = $Matches[1].Trim()
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($candidate) -and
+                    $candidate -notin @(
+                        "-",
+                        "SYSTEM",
+                        "LOCAL SERVICE",
+                        "NETWORK SERVICE"
+                    )
+                ) {
+
+                    $user = $candidate
+                }
+            }
 
 
-            # 4660 = object deletion
+            # ------------------------------------------------
+            # Determine action
+            # ------------------------------------------------
+
+            $action = $null
+
+
+            # Event 4660 = object deletion
             if ($evt.Id -eq 4660) {
 
                 $action = "Deleted"
             }
-            elseif ($msg -match '(?i)Delete|DELETE') {
+            else {
 
-                $action = "Deleted"
-            }
-            elseif ($msg -match '(?i)WriteData|AddFile|AppendData') {
+                # 4663 contains "Accesses"
+                if ($message -match '(?im)Accesses:\s*(.+?)(?:\r?\n|$)') {
 
-                $action = "Created"
-            }
-            elseif ($msg -match '(?i)WriteAttributes|WriteEA|SetSecurity') {
-
-                $action = "Modified"
-            }
+                    $access = $Matches[1]
 
 
-            $leafName = $objectName
+                    if ($access -match '(?i)Delete') {
 
-            try {
+                        $action = "Deleted"
+                    }
+                    elseif (
+                        $access -match '(?i)WriteData' -or
+                        $access -match '(?i)AppendData' -or
+                        $access -match '(?i)WriteAttributes' -or
+                        $access -match '(?i)WriteEA'
+                    ) {
 
-                if ($objectName -match '\\') {
-                    $leafName = Split-Path $objectName -Leaf
+                        $action = "Modified"
+                    }
                 }
             }
-            catch {
-                $leafName = $objectName
+
+
+            if ($null -eq $action) {
+                continue
             }
 
 
-            $files.Add(
+            # ------------------------------------------------
+            # Get filename
+            # ------------------------------------------------
+
+            $name = Split-Path $objectName -Leaf
+
+            if ([string]::IsNullOrWhiteSpace($name)) {
+
+                $name = $objectName
+            }
+
+
+            $events.Add(
                 [PSCustomObject]@{
-                    Action   = $action
-                    Name     = $leafName
-                    Time     = $evt.TimeCreated.ToString("dd MMM yyyy, HH:mm")
-                    Location = $objectName
-                    User     = $user
+                    Action     = $action
+                    Name       = $name
+                    Time       = $evt.TimeCreated
+                    Location   = $objectName
+                    User       = $user
+                    Source     = "Security"
+                    Evidence   = "Event ID $($evt.Id)"
+                    USN        = $null
+                    FileID     = $null
                 }
             )
         }
@@ -567,17 +819,93 @@ function Get-FileData {
     catch {
 
         Write-Host ""
-        Write-Host "      [!] Security file auditing is unavailable or not enabled." `
+        Write-Host "      [!] Security file auditing is not enabled." `
             -ForegroundColor DarkYellow
+
+        Write-Host "          Continuing with NTFS USN Journal evidence." `
+            -ForegroundColor DarkGreen
     }
 
 
+    # ========================================================
+    # 3. CORRELATE SECURITY + USN EVENTS
+    # ========================================================
+
+    Write-Host "  [*] Correlating file evidence..." `
+        -ForegroundColor DarkGreen
+
+
+    $final = New-Object System.Collections.Generic.List[object]
+
+
+    # --------------------------------------------------------
+    # First add USN events
+    # --------------------------------------------------------
+
+    foreach ($event in ($events | Where-Object {
+        $_.Source -eq "NTFS USN"
+    })) {
+
+        $final.Add($event)
+    }
+
+
+    # --------------------------------------------------------
+    # Process Security events
+    #
+    # If a Security event closely matches a USN event,
+    # attach the Security user/evidence to the USN record.
+    # Otherwise keep the Security event independently.
+    # --------------------------------------------------------
+
+    foreach ($security in ($events | Where-Object {
+        $_.Source -eq "Security"
+    })) {
+
+        $match = $final |
+            Where-Object {
+
+                $_.Action -eq $security.Action -and
+                $_.Name -eq $security.Name -and
+                [math]::Abs(
+                    ($_.Time - $security.Time).TotalSeconds
+                ) -le 5
+            } |
+            Select-Object -First 1
+
+
+        if ($null -ne $match) {
+
+            # Add user attribution
+            if (
+                $security.User -ne "N/A" -and
+                -not [string]::IsNullOrWhiteSpace($security.User)
+            ) {
+
+                $match.User = $security.User
+            }
+
+
+            # Combine evidence
+            $match.Source = "USN + Security"
+            $match.Evidence = "$($match.Evidence) | $($security.Evidence)"
+        }
+        else {
+
+            $final.Add($security)
+        }
+    }
+
+
+    # ========================================================
+    # 4. CLEAN / SORT / LIMIT
+    # ========================================================
+
     return @(
-        $files |
+        $final |
         Sort-Object Time
     )
 }
-
 
 # ============================================================
 # LOGIN DATA
@@ -952,71 +1280,123 @@ function Render-Files($Files, $Days) {
 
     if ($Files.Count -eq 0) {
 
-        Write-Host "      [-] No file events found. Auditing may not be enabled." `
+        Write-Host "  No file activity found in the selected period." `
             -ForegroundColor DarkGreen
+
+        return
     }
-    else {
-
-        Write-Host "  $(PR "ACTION" 12) $(PR "FILE NAME" 26) $(PR "TIME" 18) $(PR "USER" 10)" `
-            -ForegroundColor DarkGreen
 
 
-        foreach ($f in ($Files | Select-Object -First 50)) {
+    Write-Host ""
 
-            $badge = switch ($f.Action) {
+    Write-Host "  $(PR "ACTION" 11) $(PR "FILE NAME" 28) $(PR "TIME" 19) $(PR "SOURCE" 16)" `
+        -ForegroundColor DarkGreen
 
-                "Created"  { "+ CREATED" }
-                "Deleted"  { "x DELETED" }
-                "Modified" { "~ MODIFIED" }
+    Sep
 
-                default {
-                    "  ACCESSED"
-                }
+
+    foreach ($f in ($Files | Select-Object -First 100)) {
+
+        $badge = switch ($f.Action) {
+
+            "Created"  { "CREATED" }
+            "Deleted"  { "DELETED" }
+            "Modified" { "MODIFIED" }
+            "Renamed"  { "RENAMED" }
+
+            default {
+                $f.Action.ToUpper()
             }
-
-
-            $bc = switch ($f.Action) {
-
-                "Created"  { "Green" }
-                "Deleted"  { "Red" }
-                "Modified" { "Yellow" }
-
-                default {
-                    "DarkGreen"
-                }
-            }
-
-
-            $name = $f.Name
-
-            if ($name.Length -gt 26) {
-                $name = $name.Substring(0, 23) + "..."
-            }
-
-
-            Write-Host "  " -NoNewline
-
-            Write-Host $(PR $badge 12) `
-                -ForegroundColor $bc `
-                -NoNewline
-
-            Write-Host " $(PR $name 26) $(PR $f.Time 18) " `
-                -NoNewline `
-                -ForegroundColor Green
-
-            Write-Host $(PR $f.User 10) `
-                -ForegroundColor Green
         }
 
 
-        if ($Files.Count -gt 50) {
+        $bc = switch ($f.Action) {
 
-            Write-Host "      ... and $($Files.Count - 50) more events" `
-                -ForegroundColor DarkGreen
+            "Created"  { "Green" }
+            "Deleted"  { "Red" }
+            "Modified" { "Yellow" }
+            "Renamed"  { "Cyan" }
+
+            default {
+                "Green"
+            }
         }
+
+
+        $name = $f.Name
+
+        if ($name.Length -gt 28) {
+            $name = $name.Substring(0, 25) + "..."
+        }
+
+
+        $source = $f.Source
+
+        if ($source.Length -gt 16) {
+            $source = $source.Substring(0, 13) + "..."
+        }
+
+
+        Write-Host "  " -NoNewline
+
+        Write-Host $(PR $badge 11) `
+            -ForegroundColor $bc `
+            -NoNewline
+
+        Write-Host " $(PR $name 28) " `
+            -NoNewline `
+            -ForegroundColor Green
+
+        Write-Host $(PR $f.Time.ToString("dd MMM yyyy, HH:mm") 19) `
+            -NoNewline `
+            -ForegroundColor Green
+
+        Write-Host $(PR $source 16) `
+            -ForegroundColor DarkGreen
     }
+
+
+    if ($Files.Count -gt 100) {
+
+        Write-Host ""
+
+        Write-Host "  ... and $($Files.Count - 100) more events" `
+            -ForegroundColor DarkGreen
+    }
+
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    Write-Host ""
+
+    $usnCount = @(
+        $Files |
+        Where-Object {
+            $_.Source -eq "NTFS USN" -or
+            $_.Source -eq "USN + Security"
+        }
+    ).Count
+
+
+    $securityCount = @(
+        $Files |
+        Where-Object {
+            $_.Source -eq "Security" -or
+            $_.Source -eq "USN + Security"
+        }
+    ).Count
+
+
+    Write-Host "  Evidence sources:" -ForegroundColor DarkGreen
+
+    Write-Host "    NTFS USN Journal : $usnCount" `
+        -ForegroundColor DarkGreen
+
+    Write-Host "    Security 4663/4660: $securityCount" `
+        -ForegroundColor DarkGreen
 }
-
 
 # ============================================================
 # LOGIN RENDERER
@@ -1136,6 +1516,160 @@ function Render-FullReport($Software, $Files, $Logins, $Days) {
     PressEnter
 }
 
+# ============================================================
+# Export in JSON format
+# ============================================================
+
+function Export-DFINTJson {
+
+    param(
+        [hashtable]$Software,
+        [array]$Files,
+        [int]$Days
+    )
+
+    try {
+
+        # ----------------------------------------------------
+        # Create export directory
+        # ----------------------------------------------------
+
+        $exportDir = Join-Path $PSScriptRoot "reports"
+
+        if (-not (Test-Path $exportDir)) {
+
+            New-Item `
+                -ItemType Directory `
+                -Path $exportDir `
+                -Force |
+                Out-Null
+        }
+
+
+        # ----------------------------------------------------
+        # Generate filename
+        # ----------------------------------------------------
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+        $fileName = "DFINT_Report_$timestamp.json"
+
+        $outputPath = Join-Path $exportDir $fileName
+
+
+        # ----------------------------------------------------
+        # Build report
+        # ----------------------------------------------------
+
+        $report = [ordered]@{
+
+            tool = [ordered]@{
+                name    = "DFINT"
+                version = "1.0"
+            }
+
+            investigation = [ordered]@{
+                host           = $env:COMPUTERNAME
+                user           = "$env:USERDOMAIN\$env:USERNAME"
+                collectionTime = (Get-Date).ToString("o")
+                periodDays     = $Days
+                startTime      = (Get-Date).AddDays(-$Days).ToString("o")
+                endTime        = (Get-Date).ToString("o")
+            }
+
+            software = [ordered]@{
+
+                installed = @(
+                    $Software.Installed |
+                    ForEach-Object {
+
+                        [ordered]@{
+                            name      = $_.Name
+                            time      = $_.Time.ToString("o")
+                            location  = $_.Location
+                            user      = $_.User
+                            source    = $_.Source
+                            evidence  = $_.Evidence
+                        }
+                    }
+                )
+
+                uninstalled = @(
+                    $Software.Uninstalled |
+                    ForEach-Object {
+
+                        [ordered]@{
+                            name      = $_.Name
+                            time      = $_.Time.ToString("o")
+                            location  = $_.Location
+                            user      = $_.User
+                            source    = $_.Source
+                            evidence  = $_.Evidence
+                        }
+                    }
+                )
+            }
+
+
+            fileActivity = @(
+                $Files |
+                ForEach-Object {
+
+                    [ordered]@{
+                        action    = $_.Action
+                        name      = $_.Name
+                        time      = $_.Time.ToString("o")
+                        location  = $_.Location
+                        user      = $_.User
+                        source    = $_.Source
+                        evidence  = $_.Evidence
+                    }
+                }
+            )
+        }
+
+
+        # ----------------------------------------------------
+        # Convert to JSON
+        # ----------------------------------------------------
+
+        $json = $report |
+            ConvertTo-Json -Depth 10
+
+
+        # ----------------------------------------------------
+        # Write file
+        # ----------------------------------------------------
+
+        $json |
+            Out-File `
+                -FilePath $outputPath `
+                -Encoding utf8 `
+                -Force
+
+
+        Write-Host ""
+        Write-Host "  [+] JSON report exported successfully." `
+            -ForegroundColor Green
+
+        Write-Host "      $outputPath" `
+            -ForegroundColor DarkGreen
+
+        return $outputPath
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "  [!] Failed to export JSON report." `
+            -ForegroundColor Red
+
+        Write-Host "      $($_.Exception.Message)" `
+            -ForegroundColor Red
+
+        return $null
+    }
+}
+
 
 # ============================================================
 # MAIN MENU
@@ -1251,6 +1785,12 @@ while ($true) {
             $logins  = Get-LoginData -Days $days
 
             Render-FullReport $sw $files $logins $days
+
+            Export-DFINTJson `
+                -Software $sq `
+                -Files $files `
+                -Logins $logins `
+                -Days $days
         }
 
 
