@@ -1,4 +1,3 @@
-```powershell
 <#
 .SYNOPSIS
     DFIN - Digital Forensic Investigation Tool
@@ -917,43 +916,51 @@ function Get-LoginData {
 
     $start = (Get-Date).AddDays(-$Days)
 
-    $raw = New-Object System.Collections.Generic.List[object]
+    $logins = New-Object System.Collections.Generic.List[object]
+
+    Write-Host "  [~] Reading Windows login history..." `
+        -ForegroundColor DarkGreen
 
 
     try {
 
-        Write-Host "  [@] Reading Windows Security login events..." -ForegroundColor DarkGreen
-
         $events = Get-WinEvent -FilterHashtable @{
-            LogName   = 'Security'
-            Id        = 4624, 4625, 4634, 4647
+            LogName   = "Security"
+            Id        = 4624,4625,4634,4647,4648
             StartTime = $start
-        } -ErrorAction Stop | Sort-Object TimeCreated
+        } -ErrorAction Stop
 
 
         foreach ($evt in $events) {
 
-            $msg = $evt.Message
+            $message = $evt.Message
 
-            if ([string]::IsNullOrWhiteSpace($msg)) {
+            if ([string]::IsNullOrWhiteSpace($message)) {
                 continue
             }
 
 
-            $targetUser = "N/A"
-            $targetDomain = "N/A"
-            $logonType = "N/A"
-            $workstation = "N/A"
-            $ipAddress = "-"
-
-
             # ------------------------------------------------
-            # USER
+            # USERNAME
             # ------------------------------------------------
 
-            if ($msg -match '(?im)Account Name:\s+([^\r\n]+)') {
+            $user = "N/A"
 
-                $targetUser = $Matches[1].Trim()
+            if ($message -match '(?im)Account Name:\s+([^\r\n]+)') {
+
+                $candidate = $Matches[1].Trim()
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($candidate) -and
+                    $candidate -notin @(
+                        "-",
+                        "SYSTEM",
+                        "LOCAL SERVICE",
+                        "NETWORK SERVICE"
+                    )
+                ) {
+                    $user = $candidate
+                }
             }
 
 
@@ -961,9 +968,11 @@ function Get-LoginData {
             # DOMAIN
             # ------------------------------------------------
 
-            if ($msg -match '(?im)Account Domain:\s+([^\r\n]+)') {
+            $domain = "N/A"
 
-                $targetDomain = $Matches[1].Trim()
+            if ($message -match '(?im)Account Domain:\s+([^\r\n]+)') {
+
+                $domain = $Matches[1].Trim()
             }
 
 
@@ -971,19 +980,28 @@ function Get-LoginData {
             # LOGON TYPE
             # ------------------------------------------------
 
-            if ($msg -match '(?im)Logon Type:\s+(\d+)') {
+            $logonType = "N/A"
 
-                $logonType = $Matches[1]
-            }
+            if ($message -match '(?im)Logon Type:\s+(\d+)') {
 
+                $type = [int]$Matches[1]
 
-            # ------------------------------------------------
-            # WORKSTATION
-            # ------------------------------------------------
+                $logonType = switch ($type) {
 
-            if ($msg -match '(?im)Workstation Name:\s+([^\r\n]+)') {
+                    2  { "Interactive" }
+                    3  { "Network" }
+                    4  { "Batch" }
+                    5  { "Service" }
+                    7  { "Unlock" }
+                    8  { "NetworkCleartext" }
+                    9  { "NewCredentials" }
+                    10 { "RemoteInteractive (RDP)" }
+                    11 { "CachedInteractive" }
 
-                $workstation = $Matches[1].Trim()
+                    default {
+                        "Type $type"
+                    }
+                }
             }
 
 
@@ -991,105 +1009,62 @@ function Get-LoginData {
             # SOURCE IP
             # ------------------------------------------------
 
-            if ($msg -match '(?im)Source Network Address:\s+([^\r\n]+)') {
+            $ip = "N/A"
 
-                $ipAddress = $Matches[1].Trim()
-            }
+            if ($message -match '(?im)Source Network Address:\s+([^\r\n]+)') {
 
+                $candidateIP = $Matches[1].Trim()
 
-            # ------------------------------------------------
-            # FILTER SYSTEM ACCOUNTS
-            # ------------------------------------------------
-
-            if ([string]::IsNullOrWhiteSpace($targetUser)) {
-                continue
-            }
-
-            if ($targetUser -eq "N/A") {
-                continue
-            }
-
-            if ($targetUser -in @(
-                "SYSTEM",
-                "LOCAL SERVICE",
-                "NETWORK SERVICE",
-                "ANONYMOUS LOGON"
-            )) {
-                continue
-            }
-
-            if ($targetUser -match '^(UMFD|DWM|IUSR|DefaultAccount|Font Driver|Window Manager)-?\d*$') {
-                continue
-            }
-
-
-            # ------------------------------------------------
-            # EVENT TYPE
-            # ------------------------------------------------
-
-            $typeDesc = "Other"
-
-
-            switch ($evt.Id) {
-
-                4624 {
-
-                    switch ([string]$logonType) {
-
-                        "2"  { $typeDesc = "Interactive" }
-                        "3"  { $typeDesc = "Network" }
-                        "7"  { $typeDesc = "Unlock" }
-                        "10" { $typeDesc = "RemoteDesktop" }
-
-                        default {
-                            $typeDesc = "Type $logonType"
-                        }
-                    }
-                }
-
-                4625 {
-                    $typeDesc = "Failed"
-                }
-
-                4634 {
-                    $typeDesc = "Logoff"
-                }
-
-                4647 {
-                    $typeDesc = "Logoff"
+                if (
+                    -not [string]::IsNullOrWhiteSpace($candidateIP) -and
+                    $candidateIP -ne "-"
+                ) {
+                    $ip = $candidateIP
                 }
             }
 
 
-            $status = "Success"
+            # ------------------------------------------------
+            # WORKSTATION
+            # ------------------------------------------------
 
-            if ($evt.Id -eq 4625) {
-                $status = "Failed"
-            }
-            elseif ($evt.Id -in 4634,4647) {
-                $status = "Logoff"
-            }
+            $workstation = "N/A"
 
+            if ($message -match '(?im)Workstation Name:\s+([^\r\n]+)') {
 
-            $ws = $workstation
-
-            if ($ipAddress -ne "-" -and
-                $ipAddress -ne $workstation -and
-                $ipAddress -ne "::1" -and
-                $ipAddress -ne "127.0.0.1") {
-
-                $ws = "$workstation ($ipAddress)"
+                $workstation = $Matches[1].Trim()
             }
 
 
-            $raw.Add(
+            # ------------------------------------------------
+            # ACTION
+            # ------------------------------------------------
+
+            $action = switch ($evt.Id) {
+
+                4624 { "Successful Login" }
+                4625 { "Failed Login" }
+                4634 { "Logoff" }
+                4647 { "User Logoff" }
+                4648 { "Explicit Credentials" }
+
+                default {
+                    "Event $($evt.Id)"
+                }
+            }
+
+
+            $logins.Add(
                 [PSCustomObject]@{
-                    User        = $targetUser
+                    Action      = $action
+                    User        = $user
+                    Domain      = $domain
                     Time        = $evt.TimeCreated
-                    TimeStr     = $evt.TimeCreated.ToString("dd MMM yyyy, HH:mm")
-                    Type        = $typeDesc
-                    Workstation = $ws
-                    Status      = $status
+                    LogonType   = $logonType
+                    SourceIP    = $ip
+                    Workstation = $workstation
+                    EventID     = $evt.Id
+                    Source      = "Windows Security"
                 }
             )
         }
@@ -1097,25 +1072,18 @@ function Get-LoginData {
     catch {
 
         Write-Host ""
-        Write-Host "      [!] Security login events unavailable: $($_.Exception.Message)" `
+        Write-Host "  [!] Unable to read Windows Security login events." `
+            -ForegroundColor DarkYellow
+
+        Write-Host "      $($_.Exception.Message)" `
             -ForegroundColor DarkYellow
     }
 
 
-    # One event per user/type/minute
-    $deduped = @(
-        $raw |
-        Group-Object -Property {
-            $_.User + "|" + $_.Type + "|" + $_.Time.ToString("yyyyMMddHHmm")
-        } |
-        ForEach-Object {
-            $_.Group | Select-Object -First 1
-        } |
+    return @(
+        $logins |
         Sort-Object Time
     )
-
-
-    return $deduped
 }
 
 
@@ -1404,101 +1372,84 @@ function Render-Files($Files, $Days) {
 
 function Render-Logins($Logins, $Days) {
 
-    SectionHeader "[@]" "USER LOGIN HISTORY" $Logins.Count
+    SectionHeader "[>]" "LOGIN HISTORY" $Logins.Count
 
 
     if ($Logins.Count -eq 0) {
 
-        Write-Host "      [-] No login events found." -ForegroundColor DarkGreen
-    }
-    else {
-
-        Write-Host "  $(PR "USER" 16) $(PR "TIME" 21) $(PR "TYPE" 12) $(PR "WORKSTATION" 16)" `
+        Write-Host "  No login events found." `
             -ForegroundColor DarkGreen
 
+        return
+    }
 
-        foreach ($l in ($Logins | Select-Object -First 50)) {
 
-            $badge = switch ($l.Type) {
+    Write-Host ""
 
-                "Interactive"   { "[DESKTOP]" }
-                "RemoteDesktop" { "[RDP]" }
-                "Network"       { "[NETWORK]" }
-                "Unlock"        { "[UNLOCK]" }
-                "Logoff"        { "[LOGOFF]" }
-                "Failed"        { "[FAILED]" }
+    Write-Host "  $(PR "ACTION" 22) $(PR "USER" 18) $(PR "TIME" 19) $(PR "LOGON TYPE" 25) $(PR "SOURCE IP" 18)" `
+        -ForegroundColor DarkGreen
 
-                default {
-                    "[OTHER]"
-                }
+    Sep
+
+
+    foreach ($login in $Logins) {
+
+        $action = $login.Action
+
+        $color = switch ($login.Action) {
+
+            "Successful Login" { "Green" }
+            "Failed Login"     { "Red" }
+            "Logoff"           { "Yellow" }
+            "User Logoff"      { "Yellow" }
+
+            default {
+                "Cyan"
             }
-
-
-            $bc = switch ($l.Type) {
-
-                "Interactive"   { "Green" }
-                "RemoteDesktop" { "Yellow" }
-                "Network"       { "Green" }
-                "Unlock"        { "Green" }
-                "Logoff"        { "DarkGreen" }
-                "Failed"        { "Red" }
-
-                default {
-                    "DarkGreen"
-                }
-            }
-
-
-            $uc = if ($l.Status -eq "Failed") {
-                "Red"
-            }
-            else {
-                "Green"
-            }
-
-
-            $tc = if ($l.Status -eq "Failed") {
-                "Red"
-            }
-            else {
-                "Green"
-            }
-
-
-            $ws = $l.Workstation
-
-            if ($ws.Length -gt 16) {
-                $ws = $ws.Substring(0, 13) + "..."
-            }
-
-
-            Write-Host "  " -NoNewline
-
-            Write-Host $(PR $l.User 16) `
-                -ForegroundColor $uc `
-                -NoNewline
-
-            Write-Host " $(PR $l.TimeStr 21) " `
-                -NoNewline `
-                -ForegroundColor $tc
-
-            Write-Host $(PR $badge 12) `
-                -ForegroundColor $bc `
-                -NoNewline
-
-            Write-Host " $(PR $ws 16)" `
-                -ForegroundColor Green
         }
 
 
-        if ($Logins.Count -gt 50) {
+        $user = $login.User
 
-            Write-Host "      ... and $($Logins.Count - 50) more events" `
-                -ForegroundColor DarkGreen
+        if ($user.Length -gt 18) {
+            $user = $user.Substring(0, 15) + "..."
         }
+
+
+        $type = $login.LogonType
+
+        if ($type.Length -gt 25) {
+            $type = $type.Substring(0, 22) + "..."
+        }
+
+
+        $ip = $login.SourceIP
+
+        if ($ip.Length -gt 18) {
+            $ip = $ip.Substring(0, 15) + "..."
+        }
+
+
+        Write-Host "  $(PR $action 22) " `
+            -NoNewline `
+            -ForegroundColor $color
+
+        Write-Host "$(PR $user 18) " `
+            -NoNewline `
+            -ForegroundColor Green
+
+        Write-Host "$(PR $login.Time.ToString("dd MMM yyyy, HH:mm") 19) " `
+            -NoNewline `
+            -ForegroundColor Green
+
+        Write-Host "$(PR $type 25) " `
+            -NoNewline `
+            -ForegroundColor Green
+
+        Write-Host "$(PR $ip 18)" `
+            -ForegroundColor Green
     }
 }
-
 
 # ============================================================
 # FULL REPORT
@@ -1823,4 +1774,3 @@ while ($true) {
         }
     }
 }
-```
